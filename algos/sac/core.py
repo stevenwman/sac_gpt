@@ -1,11 +1,10 @@
 import numpy as np  
-import scipy.signal
-
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import Tensor
 from torch.distributions.normal import Normal
+
 
 def combined_shape(length, shape=None):
     if shape is None:
@@ -26,6 +25,7 @@ def count_vars(module: nn.Module):
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
+
 class SquashedGaussianMLPActor(nn.Module):
     
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
@@ -35,7 +35,7 @@ class SquashedGaussianMLPActor(nn.Module):
         self.log_std_layer = nn.Linear(hidden_sizes[-1], act_dim)
         self.act_limit = act_limit
 
-    def forward(self, obs, deterministic=False, with_logprob=True):
+    def forward(self, obs, deterministic=False, with_logprob=True) -> tuple[Tensor, Tensor]:
         net_out = self.net(obs)
         mu = self.mu_layer(net_out)
         log_std = self.log_std_layer(net_out)
@@ -60,34 +60,23 @@ class MLPQFunction(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1, activation])
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
 
-    def forward(self, obs, act):
+    def forward(self, obs, act) -> Tensor:
         q = self.q(torch.cat([obs, act], dim=-1))
         return torch.squeeze(q,-1)
     
 
 class MLPActorCritic(nn.Module):
 
-    def __init__(
-            self, 
-            observation_space, 
-            action_space, 
-            hidden_sizes=(256,256), 
-            activation=nn.ReLU
-            ):
-        
+    def __init__(self, obs_dim, act_dim, act_limit, hidden_sizes, activation):
         super().__init__()
-
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        act_limit = action_space.high[0]
-
         self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
         self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
         self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
 
     def act(self, obs, deterministic=False):
         with torch.no_grad():
-            a, _ = self.pi(obs, deterministic, False)
-            return a.numpy()
+            a, _ = self.pi.forward(obs, deterministic, False)
+            # return a.numpy()
+            return a

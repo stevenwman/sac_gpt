@@ -1,2 +1,5 @@
 maniskill
 torch
+tyro
+joblib
+mpi4py
