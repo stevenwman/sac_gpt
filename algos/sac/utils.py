@@ -4,29 +4,52 @@ import torch.nn as nn
 from enum import StrEnum
 import numpy as np
 import algos.sac.core as core
-
+from torch import Tensor
 
 class ReplayBuffer:
 
     def __init__(self, obs_dim, act_dim, size, device):
         self.device = device
-        self.obs_buf =  np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
-        self.rew_buf = np.zeros(size, dtype=np.float32)
-        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.obs_buf =  torch.zeros(core.combined_shape(size, obs_dim), dtype=torch.float32, device='cpu')
+        self.obs2_buf = torch.zeros(core.combined_shape(size, obs_dim), dtype=torch.float32, device='cpu')
+        self.act_buf = torch.zeros(core.combined_shape(size, act_dim), dtype=torch.float32, device='cpu')
+        self.rew_buf = torch.zeros(size, dtype=torch.float32, device='cpu')
+        self.done_buf = torch.zeros(size, dtype=torch.float32, device='cpu')
         self.ptr, self.size, self.max_size = 0, 0, size
 
         self.bufs = [self.obs_buf, self.obs2_buf, self.act_buf, self.rew_buf, self.done_buf]
 
-    def store(self, obs, act, rew, next_obs, done):
-        entries = [obs, next_obs, act, rew, done]
-        for buf, entry in zip(self.bufs, entries):
-            buf[self.ptr] = entry.detach().cpu().numpy() if isinstance(entry, torch.Tensor) else entry
-        self.ptr = (self.ptr+1) % self.max_size
-        self.size = min(self.size+1, self.max_size)
+    # def store(self, obs: Tensor, act: Tensor, rew: Tensor, next_obs: Tensor, done: Tensor):
+    #     entries = [obs, next_obs, act, rew, done]
+    #     for buf, entry in zip(self.bufs, entries):
+    #         buf[self.ptr] = entry.detach().cpu()
+    #     self.ptr = (self.ptr+1) % self.max_size
+    #     self.size = min(self.size+1, self.max_size)
 
-    def sample_batch(self, batch_size=32):
+    def store_batch(self, obs: Tensor, act: Tensor, rew: Tensor, next_obs: Tensor, done: Tensor):
+        # Assumes the first dimension of all tensors is num_envs
+        num_envs = obs.shape[0]
+        entries = [obs, next_obs, act, rew, done]
+        # Calculate the indices to store the batch
+        start_idx = self.ptr
+        end_idx = start_idx + num_envs
+        
+        # Handle buffer wrap-around
+        if end_idx > self.max_size:
+            num_part1 = self.max_size - start_idx
+            num_part2 = end_idx - self.max_size
+            for buf, entry in zip(self.bufs, entries):
+                buf[start_idx:] = entry[:num_part1].cpu()
+                buf[:num_part2] = entry[num_part1:].cpu()
+        else:
+            for buf, entry in zip(self.bufs, entries):
+                buf[start_idx:end_idx] = entry.cpu()
+
+        # Update pointer and size
+        self.ptr = (self.ptr + num_envs) % self.max_size
+        self.size = min(self.size + num_envs, self.max_size)
+
+    def sample_batch(self, batch_size):
         idxs = torch.randint(0, self.size, size=(batch_size,))
         batch = dict(obs=self.obs_buf[idxs], 
                      obs2=self.obs2_buf[idxs],

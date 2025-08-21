@@ -26,13 +26,12 @@ import tyro
 class Args:
     """ Configurations for SAC """
     seed: int = 69420
-    record: bool = False
-    save_train_video_freq: int = 1
-    save_trajectory: bool = True
+    record: bool = True
+    save_train_video_freq: int = 1_000
+    save_trajectory: bool = False
     wandb_log: bool = True
     wandb_project: str = "sac_maniskill"
     wandb_entity: str = "sman2"
-    save_freq: int = 1
     actor_critic = core.MLPActorCritic
     output_dir: str = 'runs/'
     """ RL - Params """
@@ -43,26 +42,26 @@ class Args:
     polyak: float = 0.995           # Polyak-averaging for critic network parameters
     alpha0: float = 0.2             # Entropy temperature parameter
     """ RL - Env"""
+    num_train_envs: int = 64        # Number of parallel environments
+    num_test_envs: int = 5          # Number of test environments
     start_steps: int = 10_000       # Execute random action period
-    max_ep_len: int = 500
-    num_test_episodes: int = 5
-    num_eval_steps: int = 200
+    max_ep_len: int = 100           # Max episode length
+    num_test_episodes: int = 5      # Number of test episodes
     """ RL - Update """
-    update_after: int = 10
-    update_every: int = 50
-    u2d_ratio: float = 1.
-    test_every: int = 1_000
+    update_after: int = 1_000       # Execute random policy until X samples
+    u2d_ratio: float = 3./100       # Gradient steps per X new env samples
+    test_every_updates: int = 500   # Policy eval every X updates
     """ Network configs """
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     batch_size: int = 100
     hidden_sizes: tuple[int,int] = (256,256)
     activation: ActivationType = ActivationType.RELU
     optimizer: OptimizerType = OptimizerType.ADAMW
-    lr: float = 1e-3        # Network learning-rate
+    lr: float = 1e-3                # Network learning-rate
 
 
 # TODO: add network initialization
-# TODO: make work on parallel envs
+# TODO: multi-step rollout
 
 def sac(env_fn:str, args:Args):
 
@@ -89,22 +88,31 @@ def sac(env_fn:str, args:Args):
 
     env: gym.Env
     test_env: gym.Env
-    env_kwargs = dict(obs_mode="state", sim_backend="gpu")
-    eval_env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="gpu")
-    env = gym.make(env_fn, **env_kwargs)
-    test_env = gym.make(env_fn, **eval_env_kwargs) if args.record else gym.make(env_fn, **env_kwargs)
-    obs_dim = env.observation_space.shape[-1]
-    act_dim = env.action_space.shape[0]
-    act_limit = env.action_space.high[0]
+    env_kwargs = dict(obs_mode="state", sim_backend="gpu", max_episode_steps=args.max_ep_len)
+    eval_env_kwargs = dict(**env_kwargs, render_mode="rgb_array") if args.record else env_kwargs
+    env = ManiSkillVectorEnv(
+        gym.make(env_fn, **env_kwargs, num_envs=args.num_train_envs), 
+        auto_reset=True, 
+        ignore_terminations=False)
+    test_env = ManiSkillVectorEnv(
+        gym.make(env_fn, **eval_env_kwargs, num_envs=args.num_test_envs), 
+        auto_reset=False, 
+        ignore_terminations=False)
+
+    obs_dim = env.single_observation_space.shape[-1]
+    act_dim = env.single_action_space.shape[0]
+    act_limit = env.single_action_space.high[0]
 
     if args.record:
+        save_video_trigger = lambda x : (x) % args.save_train_video_freq == 0
         test_env = RecordEpisode(
             test_env, 
             output_dir=eval_output_dir, 
             save_trajectory=args.save_trajectory, 
             save_video=args.record, 
             trajectory_name="trajectory", 
-            max_steps_per_video=args.num_eval_steps, 
+            save_video_trigger=save_video_trigger,
+            max_steps_per_video=args.max_ep_len, 
             video_fps=30
             )
 
@@ -192,7 +200,7 @@ def sac(env_fn:str, args:Args):
                 "loss/Pi_Loss": loss_pi.item(),
                 "values/Q1_Vals_Mean": q_info['Q1Vals'].mean(),
                 "values/LogPi_Mean": pi_info['LogPi'].mean()
-            }, step=t) # Use the global step 't' as the x-axis
+            }, step=global_steps) # Use the global step 't' as the x-axis
 
         with torch.no_grad():
             for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
@@ -204,28 +212,30 @@ def sac(env_fn:str, args:Args):
         return ac.act(o, deterministic)
     
     def test_agent():
-        test_returns, test_lengths = [], []
-        for j in range(args.num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset()[0], False, 0, 0
-            while not (d or (ep_len == args.max_ep_len)):
-                # Take deterministic actions at test time
-                o, r, d, _, _ = test_env.step(get_action(o, True))
-                ep_ret += r
-                ep_len += 1
-
-            test_returns.append(ep_ret.cpu().numpy())
-            test_lengths.append(ep_len)
-            # logger.store(TestEpRet=ep_ret.cpu().numpy(), TestEpLen=ep_len)
-        return {"test/return": np.mean(test_returns), "test/length": np.mean(test_lengths)}
+        truncated: Tensor
+        o, ep_ret, ep_len = test_env.reset()[0], 0., 0.
+        d = truncated = torch.tensor([False], dtype=torch.bool)
+        while not (d | truncated).all():
+            # Take deterministic actions at test time
+            o, r, d, truncated, _ = test_env.step(get_action(o, True))
+            ep_ret += r
+            ep_len += ~ (d | truncated)
+        # logger.store(TestEpRet=ep_ret.cpu().numpy(), TestEpLen=ep_len)
+        return {"test/return": torch.mean(ep_ret.cpu()), "test/length": torch.mean(ep_len.cpu())}
 
     total_steps = args.total_steps
     num_updates = 0
+    global_steps = 0
+    update_to_go = 0.0 # <-- Initialize the update budget
     start_time = time.time()
+    next_test_at_update = args.test_every_updates 
     o, ep_ret, ep_len = env.reset()[0], 0, 0
 
-    for t in range(total_steps):
+    while global_steps < total_steps:
+        global_steps += args.num_train_envs
+
         # Randomly sample actions until start_steps
-        if t > args.start_steps:
+        if global_steps > args.start_steps:
             a = get_action(o)
         else: 
             a = torch.tensor(env.action_space.sample())
@@ -235,39 +245,47 @@ def sac(env_fn:str, args:Args):
         ep_ret += r
         ep_len += 1
 
-        d = False if ep_len==args.max_ep_len else d
-
-        replay_buffer.store(o, a, r, o2, d)
+        # d = False if ep_len==args.max_ep_len else d
+        replay_buffer.store_batch(o, a, r, o2, d)
         # Update most recent observation
         o = o2
 
-        # End of traj handling
-        if d or (ep_len == args.max_ep_len):
-            o, ep_ret, ep_len = env.reset()[0], 0, 0
-            # logger.store(EpRet=ep_ret, EpLen=ep_len)
+        # # End of traj handling
+        # if d or (ep_len == args.max_ep_len):
+        #     o, ep_ret, ep_len = env.reset()[0], 0, 0
+        #     # logger.store(EpRet=ep_ret, EpLen=ep_len)
 
-        # Update handling
-        if t >= args.update_after and t % args.update_every == 0:
-            print(f"Steps: {t}")
-            print(f"Updates: {num_updates}")
-            for _ in range(round(args.update_every * args.u2d_ratio)):
-                batch = replay_buffer.sample_batch(args.batch_size)
-                update(batch)         
-                num_updates += 1
+        # Updates and evals handling
+        if global_steps >= args.update_after:
+            update_to_go += args.num_train_envs * args.u2d_ratio
+            num_updates_to_run = int(update_to_go)
 
-        if t >= args.update_after and t % args.test_every == 0:
-            test_metrics = test_agent()
-            print(f"\nStep {t}: Test Return = {test_metrics['test/return']:.2f}")
-            print(f"Step {t}: Test Length = {test_metrics['test/length']:.2f}")
+            if num_updates_to_run > 0:
+                for _ in range(num_updates_to_run):
+                    batch = replay_buffer.sample_batch(args.batch_size)
+                    update(batch) # Pass global_steps for logging
+                    num_updates += 1
+                
+                update_to_go -= num_updates_to_run
 
-            if args.wandb_log:
-                wandb.log(test_metrics, step=t)
-                wandb.log({"Updates": num_updates}, step=t)
+            if num_updates >= next_test_at_update:
+                print(f"\n--- Testing at Step: {global_steps}, Updates: {num_updates} ---")
+                test_metrics = test_agent()
+                print(f"Test Return = {test_metrics['test/return']:.2f}")
+                print(f"Test Length = {test_metrics['test/length']:.2f}")
+
+                if args.wandb_log:
+                    # For test logs, use the number of updates as the x-axis
+                    wandb.log(test_metrics, step=global_steps)
+                    wandb.log({"Updates": num_updates}, step=global_steps)
+                
+                # Set the next testing waypoint
+                next_test_at_update += args.test_every_updates
 
         # Save checkpoints
-        if (t+1) % args.ckpt_every == 0:
+        if (global_steps+1) % args.ckpt_every == 0:
             checkpoint = {
-                'steps': t,
+                'steps': global_steps,
                 'updates': num_updates,
                 'model_state': ac.state_dict(),
                 'target_state': ac_targ.state_dict(),
@@ -276,7 +294,7 @@ def sac(env_fn:str, args:Args):
                     'q': q_optimizer.state_dict(),
                 }
             }
-            logger.save(checkpoint,t, num_updates)
+            logger.save(checkpoint,global_steps, num_updates)
 
 
 if __name__ == '__main__':
