@@ -131,7 +131,7 @@ class Logger:
             with open(osp.join(self.output_dir, "config.json"), 'w') as out:
                 out.write(output)
 
-    def save(self, data: Any, iter: int):
+    def save(self, data: Any, iter: int, updates: int):
         """
         Saves a Python object to a file in the output directory.
 
@@ -139,7 +139,7 @@ class Logger:
             data (Any): The object to save (e.g., a dictionary).
             filename (str): The name of the file to save to.
         """
-        filename = f"checkpoint_{iter}.pt"
+        filename = f"checkpoint_i{iter}_u{updates}.pt"
         save_path = os.path.join(self.output_dir, filename)
         print(f"Saving data to {save_path}...")
         torch.save(data, save_path)
@@ -254,3 +254,14 @@ class EpochLogger(Logger):
         v = self.epoch_dict[key]
         vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
         return mpi_statistics_scalar(vals)
+    
+    def get_stats_dict(self):
+        """
+        Returns a dictionary of all the stats from the epoch.
+        """
+        stats = {}
+        for key in sorted(self.epoch_dict.keys()):
+            # get_stats returns (avg, std, min, max)
+            avg, _, = self.get_stats(key)
+            stats[key] = avg
+        return stats

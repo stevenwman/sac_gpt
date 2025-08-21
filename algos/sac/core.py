@@ -77,6 +77,4 @@ class MLPActorCritic(nn.Module):
 
     def act(self, obs, deterministic=False):
         with torch.no_grad():
-            a, _ = self.pi.forward(obs, deterministic, False)
-            # return a.numpy()
-            return a
+            return self.pi.forward(obs, deterministic, False)[0]
