@@ -35,33 +35,34 @@ class Args:
     actor_critic = core.MLPActorCritic
     output_dir: str = 'runs/'
     """ RL - Params """
-    total_steps: int = 1_000_000    # Total number of steps to run the environment for
+    total_steps: int = 10_000_000   # Total number of steps to run the environment for
     ckpt_every: int = 10_000        # Save checkpoint every X steps
-    replay_size: int = 1_000_000    # Total RB length
+    replay_size: int = 2_000_000    # Total RB length
     gamma: float = 0.99             # RL future reward discount factor
     polyak: float = 0.995           # Polyak-averaging for critic network parameters
-    alpha0: float = 0.2             # Entropy temperature parameter
+    alpha0: float = 0.01             # Entropy temperature parameter
     """ RL - Env"""
-    num_train_envs: int = 64        # Number of parallel environments
-    num_test_envs: int = 5          # Number of test environments
+    num_train_envs: int = 256       # Number of parallel environments
+    num_test_envs: int = 6          # Number of test environments
     start_steps: int = 10_000       # Execute random action period
     max_ep_len: int = 100           # Max episode length
-    num_test_episodes: int = 5      # Number of test episodes
+    control_mode: str = "pd_joint_delta_pos"
     """ RL - Update """
     update_after: int = 1_000       # Execute random policy until X samples
-    u2d_ratio: float = 3./100       # Gradient steps per X new env samples
-    test_every_updates: int = 500   # Policy eval every X updates
+    u2d_ratio: float = 15./100       # Gradient steps per X new env samples
+    test_every_updates: int = 1_000   # Policy eval every X updates
     """ Network configs """
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    batch_size: int = 100
-    hidden_sizes: tuple[int,int] = (256,256)
+    batch_size: int = 512
+    hidden_sizes: tuple[int,...] = (256,256,256)
     activation: ActivationType = ActivationType.RELU
     optimizer: OptimizerType = OptimizerType.ADAMW
     lr: float = 1e-3                # Network learning-rate
 
 
 # TODO: add network initialization
-# TODO: multi-step rollout
+# TODO: fix checkpoint
+# TODO: rename
 
 def sac(env_fn:str, args:Args):
 
@@ -79,7 +80,6 @@ def sac(env_fn:str, args:Args):
     eval_output_dir = save_dir + "videos/"
     os.makedirs(save_dir, exist_ok=True)
     logger_kwargs = dict(output_dir=save_dir, exp_name="sac")
-
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(args)
 
@@ -89,6 +89,8 @@ def sac(env_fn:str, args:Args):
     env: gym.Env
     test_env: gym.Env
     env_kwargs = dict(obs_mode="state", sim_backend="gpu", max_episode_steps=args.max_ep_len)
+    if args.control_mode is not None:
+        env_kwargs["control_mode"] = args.control_mode
     eval_env_kwargs = dict(**env_kwargs, render_mode="rgb_array") if args.record else env_kwargs
     env = ManiSkillVectorEnv(
         gym.make(env_fn, **env_kwargs, num_envs=args.num_train_envs), 
@@ -104,14 +106,12 @@ def sac(env_fn:str, args:Args):
     act_limit = env.single_action_space.high[0]
 
     if args.record:
-        save_video_trigger = lambda x : (x) % args.save_train_video_freq == 0
         test_env = RecordEpisode(
             test_env, 
             output_dir=eval_output_dir, 
             save_trajectory=args.save_trajectory, 
             save_video=args.record, 
             trajectory_name="trajectory", 
-            save_video_trigger=save_video_trigger,
             max_steps_per_video=args.max_ep_len, 
             video_fps=30
             )
@@ -241,10 +241,11 @@ def sac(env_fn:str, args:Args):
             a = torch.tensor(env.action_space.sample())
 
         # Step the env
-        o2, r, d, _, _ = env.step(a)
-        ep_ret += r
-        ep_len += 1
-
+        o2, r, term, trunc, _ = env.step(a)
+        # d = torch.logical_or(term, trunc)
+        d = term
+        # ep_ret += r
+        # ep_len += ~d
         # d = False if ep_len==args.max_ep_len else d
         replay_buffer.store_batch(o, a, r, o2, d)
         # Update most recent observation
